@@ -6,6 +6,7 @@ from app.schemas import TaskCreate
 from app.redis_client import redis_client
 from prometheus_client import generate_latest
 from fastapi.responses import Response
+from app.tasks import process_task
 
 Base.metadata.create_all(bind=engine)
 
@@ -43,11 +44,10 @@ def create_task(task: TaskCreate):
         new_task = models.Task(task_name=task.task_name)
 
         db.add(new_task)
-
         db.commit()
-
         db.refresh(new_task)
-        redis_client.rpush("task_queue", new_task.id)
+
+        process_task.delay(new_task.id)
 
         return {
             "id": new_task.id,

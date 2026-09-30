@@ -5,31 +5,51 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres123
       POSTGRES_DB: task_engine
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d task_engine" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     ports:
-      - "5432:5432"
+      - "5433:5432"
 
   redis:
     image: redis:7
     ports:
       - "6379:6379"
-    environment:
-      REDIS_HOST: redis
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   fastapi:
     build: .
     ports:
       - "8000:8000"
-    depends_on:
-      - postgres
-      - redis
     environment:
       DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/task_engine
+      REDIS_HOST: redis
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   worker:
     build: .
-    command: python worker.py
+    command: celery -A app.celery_app.celery_app worker --loglevel=info
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/task_engine
+      REDIS_HOST: redis
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"

@@ -1,9 +1,31 @@
+import os
+
 import streamlit as st
 import pandas as pd
 from app.database import SessionLocal
 from app import models
 import redis
 from streamlit_autorefresh import st_autorefresh
+import requests
+
+st.subheader("Create Task")
+
+task_name = st.text_input("Task Name")
+
+if st.button("Create Task"):
+    if task_name:
+        response = requests.post(
+            "http://fastapi:8000/tasks",
+            json={"task_name": task_name},
+        )
+
+        if response.status_code == 200:
+            st.success("Task created successfully")
+            st.rerun()
+        else:
+            st.error(f"Failed to create task: {response.text}")
+    else:
+        st.warning("Enter a task name")
 
 st_autorefresh(interval=5000)
 
@@ -19,8 +41,9 @@ completed_tasks = (
     db.query(models.Task).filter(models.Task.status == "COMPLETED").count()
 )
 
-dashboard_redis = redis.Redis(host="localhost", port=6379, decode_responses=True)
-
+dashboard_redis = redis.Redis(
+    host=os.getenv("REDIS_HOST", "localhost"), port=6379, decode_responses=True
+)
 queue_size = dashboard_redis.llen("task_queue")
 dlq_size = dashboard_redis.llen("dead_letter_queue")
 

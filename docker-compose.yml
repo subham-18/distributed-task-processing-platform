@@ -42,11 +42,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
+      rabbitmq:
+        condition: service_started
     environment:
       DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/task_engine
-      REDIS_HOST: redis
 
   rabbitmq:
     image: rabbitmq:3-management

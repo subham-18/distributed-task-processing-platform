@@ -22,62 +22,80 @@ def process_task(task_id):
     db = SessionLocal()
 
     try:
+        # ---------------------------------------------------------
+        # 1. Fetch task with row-level lock
+        # ---------------------------------------------------------
         task = db.query(Task).filter(Task.id == task_id).with_for_update().first()
 
         if not task:
+            print(f"Task {task_id} not found.")
             return
 
+        # ---------------------------------------------------------
+        # 2. Idempotency / duplicate protection
+        # ---------------------------------------------------------
         if task.status != "PENDING":
-            print(f"Task {task_id} is {task.status}. Skipping.")
+            print(f"Task {task_id} is already " f"{task.status}. Skipping.")
             return
 
-        # Mark task as processing
+        # ---------------------------------------------------------
+        # 3. Mark task as PROCESSING
+        # ---------------------------------------------------------
         task.status = "PROCESSING"
+        task.updated_at = datetime.now(UTC)
         db.commit()
 
-        # Start measuring actual processing
+        # ---------------------------------------------------------
+        # 4. Start processing metrics
+        # ---------------------------------------------------------
         tasks_processing.inc()
         start_time = time.perf_counter()
 
         print(f"Processing task {task_id}")
 
         try:
-            # Simulate actual work
+            # -----------------------------------------------------
+            # 5. Actual task work
+            # -----------------------------------------------------
+            # Simulate real processing
             time.sleep(5)
 
-            # Measure actual processing duration
-            duration = time.perf_counter() - start_time
-
-            task_processing_duration_seconds.observe(duration)
-            tasks_processing.dec()
-
+            # -----------------------------------------------------
+            # 6. Mark task as COMPLETED
+            # -----------------------------------------------------
             task.status = "COMPLETED"
             task.updated_at = datetime.now(UTC)
 
             db.commit()
 
+            # Increment ONLY after successful completion
             tasks_completed_total.inc()
+
+            duration = time.perf_counter() - start_time
 
             print(f"Task {task_id} completed " f"in {duration:.3f}s")
 
         except Exception as exc:
-            # Current execution has finished,
-            # so remove it from active processing.
-            tasks_processing.dec()
-
+            # -----------------------------------------------------
+            # 7. Task execution failed
+            # -----------------------------------------------------
             task.retry_count += 1
             task.updated_at = datetime.now(UTC)
 
-            # Measure failed attempt duration
-            duration = time.perf_counter() - start_time
-            task_processing_duration_seconds.observe(duration)
-
+            # -----------------------------------------------------
+            # 8. Check whether retry is allowed
+            # -----------------------------------------------------
             if task.retry_count <= MAX_RETRIES:
+
                 task.status = "PENDING"
                 db.commit()
 
                 tasks_retried_total.inc()
 
+                # Exponential backoff:
+                # retry 1 -> 2 sec
+                # retry 2 -> 4 sec
+                # retry 3 -> 8 sec
                 delay = BASE_DELAY**task.retry_count
 
                 print(
@@ -92,7 +110,9 @@ def process_task(task_id):
                     max_retries=MAX_RETRIES,
                 )
 
-            # Permanent failure
+            # -----------------------------------------------------
+            # 9. Permanent failure
+            # -----------------------------------------------------
             task.status = "FAILED"
             db.commit()
 
@@ -103,16 +123,36 @@ def process_task(task_id):
                 f"after {task.retry_count} retries"
             )
 
-            # Send permanently failed task to DLQ
+            # -----------------------------------------------------
+            # 10. Send permanently failed task to DLQ
+            # -----------------------------------------------------
             celery_app.send_task(
                 "app.tasks.handle_dead_letter",
                 args=[task_id],
             )
 
+        finally:
+            # -----------------------------------------------------
+            # 11. Metrics cleanup for EVERY processing attempt
+            # -----------------------------------------------------
+            duration = time.perf_counter() - start_time
+
+            task_processing_duration_seconds.observe(duration)
+
+            tasks_processing.dec()
+
     finally:
+        # ---------------------------------------------------------
+        # 12. Always close database connection
+        # ---------------------------------------------------------
         db.close()
 
 
 @celery_app.task
 def handle_dead_letter(task_id):
+    """
+    Handles tasks that permanently failed
+    after exhausting all retry attempts.
+    """
+
     print(f"Task {task_id} moved to DLQ")

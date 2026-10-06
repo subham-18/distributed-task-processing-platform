@@ -5,6 +5,14 @@ from app.celery_app import celery_app
 from app.database import SessionLocal
 from app.models import Task
 
+from app.metrics import (
+    tasks_completed_total,
+    tasks_failed_total,
+    tasks_retried_total,
+    tasks_processing,
+    task_processing_duration_seconds,
+)
+
 MAX_RETRIES = 3
 BASE_DELAY = 2
 
@@ -23,8 +31,13 @@ def process_task(task_id):
             print(f"Task {task_id} is {task.status}. Skipping.")
             return
 
+        # Mark task as processing
         task.status = "PROCESSING"
         db.commit()
+
+        # Start measuring actual processing
+        tasks_processing.inc()
+        start_time = time.perf_counter()
 
         print(f"Processing task {task_id}")
 
@@ -32,19 +45,38 @@ def process_task(task_id):
             # Simulate actual work
             time.sleep(5)
 
+            # Measure actual processing duration
+            duration = time.perf_counter() - start_time
+
+            task_processing_duration_seconds.observe(duration)
+            tasks_processing.dec()
+
             task.status = "COMPLETED"
             task.updated_at = datetime.now(UTC)
+
             db.commit()
 
-            print(f"Task {task_id} completed")
+            tasks_completed_total.inc()
+
+            print(f"Task {task_id} completed " f"in {duration:.3f}s")
 
         except Exception as exc:
+            # Current execution has finished,
+            # so remove it from active processing.
+            tasks_processing.dec()
+
             task.retry_count += 1
             task.updated_at = datetime.now(UTC)
+
+            # Measure failed attempt duration
+            duration = time.perf_counter() - start_time
+            task_processing_duration_seconds.observe(duration)
 
             if task.retry_count <= MAX_RETRIES:
                 task.status = "PENDING"
                 db.commit()
+
+                tasks_retried_total.inc()
 
                 delay = BASE_DELAY**task.retry_count
 
@@ -60,10 +92,16 @@ def process_task(task_id):
                     max_retries=MAX_RETRIES,
                 )
 
+            # Permanent failure
             task.status = "FAILED"
             db.commit()
 
-            print(f"Task {task_id} permanently failed")
+            tasks_failed_total.inc()
+
+            print(
+                f"Task {task_id} permanently failed "
+                f"after {task.retry_count} retries"
+            )
 
             # Send permanently failed task to DLQ
             celery_app.send_task(

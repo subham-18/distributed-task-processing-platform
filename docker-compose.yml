@@ -1,76 +1,126 @@
 services:
+
   postgres:
     image: postgres:16
+
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres123
       POSTGRES_DB: task_engine
+
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U postgres -d task_engine" ]
+
       interval: 5s
       timeout: 5s
       retries: 5
+
     ports:
       - "5433:5432"
 
   redis:
     image: redis:7
+
     ports:
       - "6379:6379"
+
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
+
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management
+
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
+
       interval: 5s
       timeout: 5s
       retries: 5
 
   fastapi:
     build: .
+
     ports:
       - "8000:8000"
+
     environment:
-      DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/task_engine
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres123@postgres:5432/task_engine
       REDIS_HOST: redis
+
     depends_on:
       postgres:
         condition: service_healthy
+
       redis:
         condition: service_healthy
 
   worker:
     build: .
-    command: celery -A app.celery_app worker --loglevel=info
+
+    command: >
+      celery -A app.celery_app.celery_app worker --loglevel=info
+
     environment:
-      DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/task_engine
-      REDIS_HOST: redis
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres123@postgres:5432/task_engine
+
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
+
       rabbitmq:
         condition: service_healthy
 
-  rabbitmq:
-    image: rabbitmq:3-management
+  load-generator:
+    build: .
+
+    command: >
+      uvicorn load_generator:app --host 0.0.0.0 --port 9000
+
     ports:
-      - "5672:5672"
-      - "15672:15672"
-    healthcheck:
-      test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      - "9000:9000"
+
+    environment:
+      TARGET_URL: http://fastapi:8000
+
+    depends_on:
+      fastapi:
+        condition: service_started
 
   dashboard:
     build: .
-    command: streamlit run dashboard.py --server.address=0.0.0.0 --server.port=8501
+
+    command: >
+      streamlit run dashboard.py --server.address=0.0.0.0 --server.port=8501
+
     ports:
       - "8501:8501"
+
     environment:
-      DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/task_engine
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres123@postgres:5432/task_engine
+
       REDIS_HOST: redis
+
+      API_URL: http://fastapi:8000
+
+      LOAD_GENERATOR_URL: http://load-generator:9000
+
     depends_on:
       postgres:
         condition: service_healthy
+
       redis:
         condition: service_healthy
+
+      fastapi:
+        condition: service_started
+
+      load-generator:
+        condition: service_started

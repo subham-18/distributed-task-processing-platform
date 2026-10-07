@@ -1,12 +1,12 @@
 import os
 import time
+from datetime import datetime, UTC
 
 import pandas as pd
 import redis
 import requests
 import streamlit as st
 from sqlalchemy import create_engine, text
-
 
 # ============================================================
 # CONFIGURATION
@@ -48,6 +48,7 @@ st.set_page_config(
 # DATABASE
 # ============================================================
 
+
 @st.cache_resource
 def get_db_engine():
     return create_engine(
@@ -59,6 +60,7 @@ def get_db_engine():
 # ============================================================
 # REDIS
 # ============================================================
+
 
 @st.cache_resource
 def get_redis():
@@ -77,9 +79,6 @@ redis_client = get_redis()
 # SESSION STATE
 # ============================================================
 
-if "load_test_history" not in st.session_state:
-    st.session_state.load_test_history = []
-
 if "last_saved_test_id" not in st.session_state:
     st.session_state.last_saved_test_id = None
 
@@ -88,10 +87,10 @@ if "last_saved_test_id" not in st.session_state:
 # DATABASE FUNCTIONS
 # ============================================================
 
+
 def get_task_metrics():
 
-    query = text(
-        """
+    query = text("""
         SELECT
             COUNT(*) AS total,
 
@@ -117,22 +116,18 @@ def get_task_metrics():
             ) AS retries
 
         FROM tasks
-        """
-    )
+        """)
 
     with db.connect() as connection:
 
-        result = connection.execute(
-            query
-        ).mappings().first()
+        result = connection.execute(query).mappings().first()
 
     return result
 
 
 def get_recent_tasks():
 
-    query = text(
-        """
+    query = text("""
         SELECT
             id,
             task_name,
@@ -146,8 +141,7 @@ def get_recent_tasks():
         ORDER BY id DESC
 
         LIMIT 20
-        """
-    )
+        """)
 
     with db.connect() as connection:
 
@@ -163,9 +157,139 @@ def get_recent_tasks():
     )
 
 
+def initialize_load_test_table():
+
+    query = text("""
+        CREATE TABLE IF NOT EXISTS load_test_runs (
+            id BIGSERIAL PRIMARY KEY,
+            test_id VARCHAR(100) NOT NULL UNIQUE,
+            started_at TIMESTAMPTZ,
+            completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            users INTEGER NOT NULL,
+            spawn_rate INTEGER NOT NULL,
+            duration INTEGER NOT NULL,
+            requests BIGINT NOT NULL DEFAULT 0,
+            failures BIGINT NOT NULL DEFAULT 0,
+            success_rate DOUBLE PRECISION NOT NULL DEFAULT 100.0,
+            rps DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            avg_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            p50_ms DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            p95_ms DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            p99_ms DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            max_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0.0
+        )
+    """)
+
+    with db.begin() as connection:
+        connection.execute(query)
+
+
+def save_load_test_run(status):
+
+    test_id = status.get("test_id")
+
+    if not test_id:
+        return
+
+    query = text("""
+        INSERT INTO load_test_runs (
+            test_id,
+            started_at,
+            completed_at,
+            users,
+            spawn_rate,
+            duration,
+            requests,
+            failures,
+            success_rate,
+            rps,
+            avg_latency_ms,
+            p50_ms,
+            p95_ms,
+            p99_ms,
+            max_latency_ms
+        )
+        VALUES (
+            :test_id,
+            :started_at,
+            :completed_at,
+            :users,
+            :spawn_rate,
+            :duration,
+            :requests,
+            :failures,
+            :success_rate,
+            :rps,
+            :avg_latency_ms,
+            :p50_ms,
+            :p95_ms,
+            :p99_ms,
+            :max_latency_ms
+        )
+        ON CONFLICT (test_id) DO NOTHING
+    """)
+
+    values = {
+        "test_id": test_id,
+        "started_at": status.get("started_at"),
+        "completed_at": datetime.now(UTC),
+        "users": status.get("target_users", 0),
+        "spawn_rate": status.get("spawn_rate", 0),
+        "duration": status.get("duration", 0),
+        "requests": status.get("requests", 0),
+        "failures": status.get("failures", 0),
+        "success_rate": status.get("success_rate", 100.0),
+        "rps": status.get("rps", 0.0),
+        "avg_latency_ms": status.get("avg_latency_ms", 0.0),
+        "p50_ms": status.get("p50_ms", 0.0),
+        "p95_ms": status.get("p95_ms", 0.0),
+        "p99_ms": status.get("p99_ms", 0.0),
+        "max_latency_ms": status.get("max_latency_ms", 0.0),
+    }
+
+    with db.begin() as connection:
+        connection.execute(query, values)
+
+
+def get_load_test_history():
+
+    query = text("""
+        SELECT
+            test_id AS "Test ID",
+            users AS "Users",
+            spawn_rate AS "Spawn Rate",
+            duration AS "Duration",
+            requests AS "Requests",
+            failures AS "Failures",
+            ROUND(success_rate::numeric, 2) AS "Success %",
+            ROUND(rps::numeric, 2) AS "RPS",
+            ROUND(avg_latency_ms::numeric, 2) AS "Avg ms",
+            ROUND(p50_ms::numeric, 2) AS "P50 ms",
+            ROUND(p95_ms::numeric, 2) AS "P95 ms",
+            ROUND(p99_ms::numeric, 2) AS "P99 ms",
+            ROUND(max_latency_ms::numeric, 2) AS "Max ms",
+            started_at AS "Started At",
+            completed_at AS "Completed At"
+        FROM load_test_runs
+        ORDER BY completed_at DESC
+        LIMIT 50
+    """)
+
+    with db.connect() as connection:
+        result = connection.execute(query)
+        rows = result.fetchall()
+        columns = result.keys()
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+initialize_load_test_table()
+
+
 # ============================================================
 # LOAD GENERATOR API
 # ============================================================
+
 
 def start_load_test(
     users: int,
@@ -189,9 +313,7 @@ def start_load_test(
 
     except requests.RequestException as exc:
 
-        st.error(
-            f"Could not connect to load generator: {exc}"
-        )
+        st.error(f"Could not connect to load generator: {exc}")
 
         return None
 
@@ -209,9 +331,7 @@ def stop_load_test():
 
     except requests.RequestException as exc:
 
-        st.error(
-            f"Could not stop load test: {exc}"
-        )
+        st.error(f"Could not stop load test: {exc}")
 
         return None
 
@@ -240,13 +360,9 @@ def get_load_test_status():
 # HEADER
 # ============================================================
 
-st.title(
-    "⚙️ Distributed Task Processing Engine"
-)
+st.title("⚙️ Distributed Task Processing Engine")
 
-st.caption(
-    "FastAPI • PostgreSQL • RabbitMQ • Celery • Redis • Docker"
-)
+st.caption("FastAPI • PostgreSQL • RabbitMQ • Celery • Redis • Docker")
 
 st.divider()
 
@@ -257,13 +373,9 @@ st.divider()
 
 metrics = get_task_metrics()
 
-queue_size = redis_client.llen(
-    "task_queue"
-)
+queue_size = redis_client.llen("task_queue")
 
-dlq_size = redis_client.llen(
-    "dead_letter_queue"
-)
+dlq_size = redis_client.llen("dead_letter_queue")
 
 total_tasks = metrics["total"]
 pending_tasks = metrics["pending"]
@@ -277,9 +389,7 @@ retry_count = metrics["retries"]
 # SYSTEM OVERVIEW
 # ============================================================
 
-st.subheader(
-    "System Overview"
-)
+st.subheader("System Overview")
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -350,13 +460,9 @@ st.divider()
 # CREATE TASK
 # ============================================================
 
-st.subheader(
-    "Create Task"
-)
+st.subheader("Create Task")
 
-with st.form(
-    "create_task_form"
-):
+with st.form("create_task_form"):
 
     task_name = st.text_input(
         "Task Name",
@@ -372,9 +478,7 @@ with st.form(
 
         if not task_name.strip():
 
-            st.warning(
-                "Enter a task name."
-            )
+            st.warning("Enter a task name.")
 
         else:
 
@@ -382,17 +486,13 @@ with st.form(
 
                 response = requests.post(
                     f"{API_URL}/tasks",
-                    json={
-                        "task_name": task_name
-                    },
+                    json={"task_name": task_name},
                     timeout=10,
                 )
 
                 if response.status_code == 200:
 
-                    st.success(
-                        f"Task '{task_name}' created successfully."
-                    )
+                    st.success(f"Task '{task_name}' created successfully.")
 
                     time.sleep(0.5)
 
@@ -400,16 +500,11 @@ with st.form(
 
                 else:
 
-                    st.error(
-                        f"Task creation failed: "
-                        f"{response.text}"
-                    )
+                    st.error(f"Task creation failed: " f"{response.text}")
 
             except requests.RequestException as exc:
 
-                st.error(
-                    f"Could not connect to API: {exc}"
-                )
+                st.error(f"Could not connect to API: {exc}")
 
 
 st.divider()
@@ -419,9 +514,7 @@ st.divider()
 # TASK DISTRIBUTION
 # ============================================================
 
-st.subheader(
-    "Task Distribution"
-)
+st.subheader("Task Distribution")
 
 distribution = pd.DataFrame(
     {
@@ -440,11 +533,7 @@ distribution = pd.DataFrame(
     }
 )
 
-st.bar_chart(
-    distribution.set_index(
-        "Status"
-    )
-)
+st.bar_chart(distribution.set_index("Status"))
 
 
 st.divider()
@@ -454,61 +543,40 @@ st.divider()
 # DISTRIBUTED WORKER SYSTEM
 # ============================================================
 
-st.subheader(
-    "Distributed Worker System"
-)
+st.subheader("Distributed Worker System")
 
 col1, col2 = st.columns(2)
 
 with col1:
 
-    st.markdown(
-        "### Queue State"
-    )
+    st.markdown("### Queue State")
 
-    st.write(
-        f"**Main Queue:** `{queue_size}` tasks"
-    )
+    st.write(f"**Main Queue:** `{queue_size}` tasks")
 
-    st.write(
-        f"**Dead Letter Queue:** `{dlq_size}` tasks"
-    )
+    st.write(f"**Dead Letter Queue:** `{dlq_size}` tasks")
 
     if queue_size > 0:
 
-        st.warning(
-            "Tasks are waiting in the queue."
-        )
+        st.warning("Tasks are waiting in the queue.")
 
     else:
 
-        st.success(
-            "Queue is currently empty."
-        )
+        st.success("Queue is currently empty.")
 
 
 with col2:
 
-    st.markdown(
-        "### Worker State"
-    )
+    st.markdown("### Worker State")
 
-    st.write(
-        f"**Tasks currently processing:** "
-        f"`{processing_tasks}`"
-    )
+    st.write(f"**Tasks currently processing:** " f"`{processing_tasks}`")
 
     if processing_tasks > 0:
 
-        st.info(
-            "Workers are actively processing tasks."
-        )
+        st.info("Workers are actively processing tasks.")
 
     else:
 
-        st.success(
-            "No tasks are currently processing."
-        )
+        st.success("No tasks are currently processing.")
 
 
 st.divider()
@@ -518,9 +586,7 @@ st.divider()
 # SYSTEM HEALTH
 # ============================================================
 
-st.subheader(
-    "System Health"
-)
+st.subheader("System Health")
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -537,21 +603,15 @@ with col1:
 
         if response.status_code == 200:
 
-            st.success(
-                "FastAPI: Healthy"
-            )
+            st.success("FastAPI: Healthy")
 
         else:
 
-            st.error(
-                "FastAPI: Unhealthy"
-            )
+            st.error("FastAPI: Unhealthy")
 
     except requests.RequestException:
 
-        st.error(
-            "FastAPI: Unreachable"
-        )
+        st.error("FastAPI: Unreachable")
 
 
 # Redis
@@ -561,15 +621,11 @@ with col2:
 
         redis_client.ping()
 
-        st.success(
-            "Redis: Healthy"
-        )
+        st.success("Redis: Healthy")
 
     except redis.RedisError:
 
-        st.error(
-            "Redis: Unhealthy"
-        )
+        st.error("Redis: Unhealthy")
 
 
 # PostgreSQL
@@ -579,19 +635,13 @@ with col3:
 
         with db.connect() as connection:
 
-            connection.execute(
-                text("SELECT 1")
-            )
+            connection.execute(text("SELECT 1"))
 
-        st.success(
-            "PostgreSQL: Healthy"
-        )
+        st.success("PostgreSQL: Healthy")
 
     except Exception:
 
-        st.error(
-            "PostgreSQL: Unhealthy"
-        )
+        st.error("PostgreSQL: Unhealthy")
 
 
 # Load Generator
@@ -606,21 +656,15 @@ with col4:
             False,
         ):
 
-            st.success(
-                "Load Generator: Running"
-            )
+            st.success("Load Generator: Running")
 
         else:
 
-            st.success(
-                "Load Generator: Ready"
-            )
+            st.success("Load Generator: Ready")
 
     else:
 
-        st.error(
-            "Load Generator: Unreachable"
-        )
+        st.error("Load Generator: Unreachable")
 
 
 st.divider()
@@ -630,17 +674,13 @@ st.divider()
 # RECENT TASKS
 # ============================================================
 
-st.subheader(
-    "Recent Tasks"
-)
+st.subheader("Recent Tasks")
 
 recent_tasks = get_recent_tasks()
 
 if recent_tasks.empty:
 
-    st.info(
-        "No tasks found."
-    )
+    st.info("No tasks found.")
 
 else:
 
@@ -658,13 +698,9 @@ st.divider()
 # PERFORMANCE LAB
 # ============================================================
 
-st.subheader(
-    "⚡ Performance Lab"
-)
+st.subheader("⚡ Performance Lab")
 
-st.caption(
-    "Real Locust load testing against the FastAPI service."
-)
+st.caption("Real Locust load testing against the FastAPI service.")
 
 
 # ============================================================
@@ -740,10 +776,6 @@ with button_col2:
     )
 
 
-# ============================================================
-# START LOAD TEST
-# ============================================================
-
 if start_clicked:
 
     response = start_load_test(
@@ -765,14 +797,7 @@ if start_clicked:
 
         else:
 
-            st.error(
-                response.text
-            )
-
-
-# ============================================================
-# STOP LOAD TEST
-# ============================================================
+            st.error(response.text)
 
 if stop_clicked:
 
@@ -782,41 +807,30 @@ if stop_clicked:
 
         if response.status_code == 200:
 
-            st.warning(
-                "Load test stopped."
-            )
+            st.warning("Load test stopped.")
 
         else:
 
-            st.error(
-                response.text
-            )
+            st.error(response.text)
 
 
 # ============================================================
 # LIVE PERFORMANCE MONITOR
 # ============================================================
 
-st.markdown(
-    "### Live Load Test Metrics"
-)
+st.markdown("### Live Load Test Metrics")
 
 
-@st.fragment(
-    run_every="2s"
-)
+@st.fragment(run_every="2s")
 def live_performance_monitor():
 
     status = get_load_test_status()
 
     if not status:
 
-        st.error(
-            "Load generator unavailable."
-        )
+        st.error("Load generator unavailable.")
 
         return
-
 
     # ========================================================
     # TEST STATUS
@@ -829,16 +843,11 @@ def live_performance_monitor():
 
     if running:
 
-        st.info(
-            "🟢 Load test running"
-        )
+        st.info("🟢 Load test running")
 
     else:
 
-        st.success(
-            "⚪ Load test idle"
-        )
-
+        st.success("⚪ Load test idle")
 
     # ========================================================
     # REQUEST METRICS
@@ -863,7 +872,6 @@ def live_performance_monitor():
         "rps",
         0.0,
     )
-
 
     col1, col2, col3, col4 = st.columns(4)
 
@@ -895,14 +903,11 @@ def live_performance_monitor():
             f"{success_rate:.2f}%",
         )
 
-
     # ========================================================
     # LATENCY
     # ========================================================
 
-    st.markdown(
-        "#### Response Latency"
-    )
+    st.markdown("#### Response Latency")
 
     average_latency = status.get(
         "avg_latency_ms",
@@ -928,7 +933,6 @@ def live_performance_monitor():
         "max_latency_ms",
         0.0,
     )
-
 
     col1, col2, col3, col4, col5 = st.columns(5)
 
@@ -967,14 +971,11 @@ def live_performance_monitor():
             f"{max_latency:.2f} ms",
         )
 
-
     # ========================================================
     # LOAD
     # ========================================================
 
-    st.markdown(
-        "#### Load"
-    )
+    st.markdown("#### Load")
 
     active_users = status.get(
         "active_users",
@@ -990,7 +991,6 @@ def live_performance_monitor():
         "spawn_rate",
         0,
     )
-
 
     col1, col2, col3 = st.columns(3)
 
@@ -1015,83 +1015,33 @@ def live_performance_monitor():
             f"{current_spawn_rate}/sec",
         )
 
-
     # ========================================================
     # TEST INFORMATION
     # ========================================================
 
-    started_at = status.get(
-        "started_at"
-    )
+    started_at = status.get("started_at")
 
-    test_duration = status.get(
-        "duration"
-    )
+    test_duration = status.get("duration")
 
     if started_at:
 
-        st.caption(
-            f"Started: {started_at}"
-        )
+        st.caption(f"Started: {started_at}")
 
     if test_duration:
 
-        st.caption(
-            f"Duration: {test_duration} seconds"
-        )
-
+        st.caption(f"Duration: {test_duration} seconds")
 
     # ========================================================
     # SAVE COMPLETED TEST
     # ========================================================
 
-    test_id = status.get(
-        "test_id"
-    )
+    test_id = status.get("test_id")
 
-    if (
-        not running
-        and test_id
-        and test_id != st.session_state.last_saved_test_id
-    ):
+    if not running and test_id and test_id != st.session_state.last_saved_test_id:
 
-        result = {
-            "Test ID": test_id,
+        save_load_test_run(status)
 
-            "Users": target_users,
-
-            "Spawn Rate": current_spawn_rate,
-
-            "Duration": test_duration,
-
-            "Requests": requests_count,
-
-            "Failures": failures,
-
-            "Success %": success_rate,
-
-            "RPS": current_rps,
-
-            "Avg ms": average_latency,
-
-            "P50 ms": p50,
-
-            "P95 ms": p95,
-
-            "P99 ms": p99,
-
-            "Max ms": max_latency,
-        }
-
-
-        st.session_state.load_test_history.append(
-            result
-        )
-
-        st.session_state.last_saved_test_id = (
-            test_id
-        )
-
+        st.session_state.last_saved_test_id = test_id
 
     # ========================================================
     # LOAD TEST HISTORY
@@ -1099,20 +1049,11 @@ def live_performance_monitor():
 
     st.divider()
 
-    st.subheader(
-        "📊 Load Test History"
-    )
+    st.subheader("📊 Load Test History")
 
+    history_df = get_load_test_history()
 
-    history = st.session_state.load_test_history
-
-
-    if history:
-
-        history_df = pd.DataFrame(
-            history
-        )
-
+    if not history_df.empty:
 
         # ----------------------------------------------------
         # TABLE
@@ -1124,15 +1065,11 @@ def live_performance_monitor():
             hide_index=True,
         )
 
-
         # ----------------------------------------------------
         # THROUGHPUT
         # ----------------------------------------------------
 
-        st.markdown(
-            "### Throughput"
-        )
-
+        st.markdown("### Throughput")
 
         chart_df = history_df[
             [
@@ -1141,25 +1078,16 @@ def live_performance_monitor():
             ]
         ].copy()
 
+        chart_df = chart_df.set_index("Test ID")
+        chart_df = chart_df.iloc[::-1]
 
-        chart_df = chart_df.set_index(
-            "Test ID"
-        )
-
-
-        st.line_chart(
-            chart_df
-        )
-
+        st.line_chart(chart_df)
 
         # ----------------------------------------------------
         # LATENCY
         # ----------------------------------------------------
 
-        st.markdown(
-            "### Latency"
-        )
-
+        st.markdown("### Latency")
 
         latency_df = history_df[
             [
@@ -1170,22 +1098,14 @@ def live_performance_monitor():
             ]
         ].copy()
 
+        latency_df = latency_df.set_index("Test ID")
+        latency_df = latency_df.iloc[::-1]
 
-        latency_df = latency_df.set_index(
-            "Test ID"
-        )
-
-
-        st.line_chart(
-            latency_df
-        )
-
+        st.line_chart(latency_df)
 
     else:
 
-        st.info(
-            "No load tests completed yet."
-        )
+        st.info("No load tests completed yet.")
 
 
 # ============================================================
@@ -1196,6 +1116,47 @@ live_performance_monitor()
 
 
 st.divider()
+
+
+# ============================================================
+# ARCHITECTURE
+# ============================================================
+
+st.subheader("🏗️ System Architecture")
+
+st.code(
+    """
+Browser
+   │
+   ▼
+Streamlit Dashboard :8501
+   │
+   │ control + metrics
+   ▼
+Load Generator :9000
+   │
+   │ Locust HTTP load
+   ▼
+FastAPI :8000
+   │
+   ├──────────────► PostgreSQL
+   │
+   ├──────────────► RabbitMQ
+   │                    │
+   │                    ▼
+   │                 Celery
+   │                    │
+   │                    ▼
+   │                 Workers
+   │
+   └──────────────► Redis
+
+Dashboard and Locust
+run as separate services.
+""",
+    language="text",
+)
+
 
 # ============================================================
 # FOOTER
